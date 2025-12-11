@@ -29,21 +29,28 @@ find_package(ndt_omp_ros2 REQUIRED)
 find_package(OpenMP)
 find_package(rosidl_default_generators REQUIRED)
 
-# ❌ REMOVE this – you are already in lidar_localization_ros2
 # find_package(lidar_localization_ros2 REQUIRED)
 
 if (OPENMP_FOUND)
   set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
   set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 endif()
+set(msg_files
+  "msg/MapChunk.msg"
+)
+set(srv_files
+  "srv/RequestChunks.srv"
+)
+
+
 
 # ----------------- MESSAGES -----------------
 set(msg_files
   "msg/MapChunk.msg"
 )
-
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${msg_files}
+  ${srv_files}
   DEPENDENCIES std_msgs sensor_msgs
 )
 

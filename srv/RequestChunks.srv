@@ -1,0 +1,6 @@
+# RequestChunks.srv
+uint32 map_id
+uint32[] chunk_ids
+---
+bool success
+string message

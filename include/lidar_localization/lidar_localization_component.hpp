@@ -36,6 +36,7 @@
 #include <pclomp/gicp_omp_impl.hpp>
 
 #include "lidar_localization/lidar_undistortion.hpp"
+#include "lidar_localization_ros2/srv/request_chunks.hpp"
 
 using namespace std::chrono_literals;
 
@@ -62,8 +63,12 @@ public:
   void imuReceived(const sensor_msgs::msg::Imu::ConstSharedPtr msg);
   void cloudReceived(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void sendMapInChunks(const pcl::PointCloud<pcl::PointXYZI>::Ptr & map_cloud_ptr);
-  // void gnssReceived();
 
+  // void gnssReceived();
+  void handleRequestChunks(
+  const std::shared_ptr<rmw_request_id_t> request_header,
+  const std::shared_ptr<lidar_localization_ros2::srv::RequestChunks::Request> req,
+  const std::shared_ptr<lidar_localization_ros2::srv::RequestChunks::Response> res);
   tf2_ros::TransformBroadcaster broadcaster_;
   rclcpp::Clock clock_;
   tf2_ros::Buffer tfbuffer_;
@@ -96,6 +101,12 @@ public:
 
   bool map_recieved_{false};
   bool initialpose_recieved_{false};
+  
+  // store chunks for retransmit
+  std::mutex chunk_cache_mutex_;
+  std::unordered_map<uint32_t, std::vector<sensor_msgs::msg::PointCloud2>> chunk_cache_; // map_id -> vector indexed by chunk_id
+
+  rclcpp::Service<lidar_localization_ros2::srv::RequestChunks>::SharedPtr request_chunks_srv_;
 
   // parameters
   double map_leaf_size_;

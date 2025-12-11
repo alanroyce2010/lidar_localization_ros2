@@ -123,9 +123,14 @@ void PCLLocalization::sendMapInChunks(
     get_logger(),
     "Chunking into %zu chunks (points_per_chunk=%zu, total_points_after_filter=%zu)",
     total_chunks, points_per_chunk, total_points);
+  {
+    std::lock_guard<std::mutex> lock(chunk_cache_mutex_);
+    chunk_cache_[map_id].resize(total_chunks);
+  }
 
-  for (std::size_t chunk_id = 0; chunk_id < total_chunks; ++chunk_id) {
-    std::size_t start_idx = chunk_id * points_per_chunk;
+for (std::size_t chunk_id = 0; chunk_id < total_chunks; ++chunk_id) {
+  // ... create cloud_msg as before ...
+  std::size_t start_idx = chunk_id * points_per_chunk;
     std::size_t end_idx = std::min(start_idx + points_per_chunk, total_points);
 
     // build a chunk cloud
@@ -167,27 +172,28 @@ void PCLLocalization::sendMapInChunks(
       cloud_msg.header.frame_id = global_frame_id_;
       cloud_msg.header.stamp = now();
 
+      
+      
+  {
+    std::lock_guard<std::mutex> lock(chunk_cache_mutex_);
+    chunk_cache_[map_id][chunk_id] = cloud_msg;  // copy/store for retransmit
+  }
+
       lidar_localization_ros2::msg::MapChunk chunk_msg;
       chunk_msg.header = cloud_msg.header;
       chunk_msg.map_id = map_id;
       chunk_msg.chunk_id = static_cast<uint32_t>(chunk_id);
       chunk_msg.total_chunks = static_cast<uint32_t>(total_chunks);
-      chunk_msg.cloud = cloud_msg;
-
-      chunk_pub_->publish(chunk_msg);
-      RCLCPP_INFO(
-        get_logger(),
-        "Published chunk %zu/%zu (points=%zu) [XYZ only]",
-        chunk_id + 1, total_chunks, chunk_cloud->size());
-    }
-    // optional small sleep to avoid saturating the network
-    // std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  }
+      chunk_msg.cloud = cloud_msg;  // fill chunk_msg...
+  chunk_pub_->publish(chunk_msg);
+  rclcpp::sleep_for(std::chrono::milliseconds(10)); // small spacing
+}
+  
 
   RCLCPP_INFO(get_logger(), "Finished sending chunks for map_id=%u", map_id);
 }
 
-
+}
 CallbackReturn PCLLocalization::on_activate(const rclcpp_lifecycle::State &)
 {
   RCLCPP_INFO(get_logger(), "Activating");
@@ -368,10 +374,68 @@ void PCLLocalization::initializeParameters()
   RCLCPP_INFO(get_logger(),"enable_timer_publishing: %d", enable_timer_publishing_);
   RCLCPP_INFO(get_logger(),"pose_publish_frequency: %lf", pose_publish_frequency_);
 }
+void PCLLocalization::handleRequestChunks(
+  const std::shared_ptr<rmw_request_id_t> request_header,
+  const std::shared_ptr<lidar_localization_ros2::srv::RequestChunks::Request> req,
+  const std::shared_ptr<lidar_localization_ros2::srv::RequestChunks::Response> res)
+{
+  (void)request_header;
+  const uint32_t map_id = req->map_id;
+  const auto & chunk_ids = req->chunk_ids;
+
+  RCLCPP_INFO(get_logger(), "RequestChunks: map_id=%u requested %zu chunks", map_id, chunk_ids.size());
+
+  std::vector<sensor_msgs::msg::PointCloud2> cached;
+  {
+    std::lock_guard<std::mutex> lock(chunk_cache_mutex_);
+    auto it = chunk_cache_.find(map_id);
+    if (it == chunk_cache_.end()) {
+      res->success = false;
+      res->message = "map_id not found";
+      RCLCPP_WARN(get_logger(), "%s", res->message.c_str());
+      return;
+    }
+    // keep reference to validate indices
+    cached = it->second;
+  }
+
+  // Republish requested chunk ids (on the same topic) so receiver code is unchanged
+  for (uint32_t cid : chunk_ids) {
+    if (cid >= cached.size()) {
+      RCLCPP_WARN(get_logger(), "Requested chunk_id %u out of range (0..%zu)", cid, cached.size()-1);
+      continue;
+    }
+
+    // reconstruct MapChunk message
+    lidar_localization_ros2::msg::MapChunk chunk_msg;
+    chunk_msg.header = cached[cid].header;
+    chunk_msg.map_id = map_id;
+    chunk_msg.chunk_id = cid;
+    chunk_msg.total_chunks = static_cast<uint32_t>(cached.size());
+    chunk_msg.cloud = cached[cid];
+
+    chunk_pub_->publish(chunk_msg);
+    RCLCPP_INFO(get_logger(), "Re-published chunk %u for map_id %u", cid, map_id);
+    // small pause to avoid saturating the network
+    rclcpp::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  res->success = true;
+  res->message = "requested chunks re-published";
+}
 
 void PCLLocalization::initializePubSub()
 {
   RCLCPP_INFO(get_logger(), "initializePubSub");
+  request_chunks_srv_ = create_service<lidar_localization_ros2::srv::RequestChunks>(
+  "request_chunks",
+  std::bind(
+      &PCLLocalization::handleRequestChunks,
+      this,
+      std::placeholders::_1,  // request_header
+      std::placeholders::_2,  // request
+      std::placeholders::_3   // response
+  ));
 
   pose_pub_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
     "pcl_pose",
