@@ -8,6 +8,10 @@ PCLLocalization::PCLLocalization(const rclcpp::NodeOptions & options)
   tflistener_(tfbuffer_),
   broadcaster_(this)
 {
+
+  declare_parameter("map_leaf_size", 0.05f);
+  declare_parameter("points_per_chunk", 200000);
+  declare_parameter("drop_intensity", false);
   declare_parameter("global_frame_id", "map");
   declare_parameter("odom_frame_id", "odom");
   declare_parameter("base_frame_id", "base_link");
@@ -64,58 +68,125 @@ void PCLLocalization::sendMapInChunks(
     return;
   }
 
-  const std::size_t total_points = map_cloud_ptr->size();
-  if (total_points == 0) {
+  const std::size_t total_points_orig = map_cloud_ptr->size();
+  if (total_points_orig == 0) {
     RCLCPP_WARN(get_logger(), "Map cloud is empty, not sending chunks");
     return;
   }
 
-  const std::size_t points_per_chunk = 200000;
-
-  const std::size_t total_chunks =
-    (total_points + points_per_chunk - 1) / points_per_chunk;
-
+  // === TUNABLE PARAMETERS ===
+  const float leaf_size = map_leaf_size_;           // 5 cm voxel (tweak as needed)
+  const std::size_t points_per_chunk = points_per_chunk_; // tune for network
+  const bool drop_intensity = drop_intensity_;       // set true to remove intensity field
   const uint32_t map_id = 1;
+  // ===========================
 
   RCLCPP_INFO(
     get_logger(),
-    "Sending map in %zu chunks (total_points=%zu, points_per_chunk=%zu)",
-    total_chunks, total_points, points_per_chunk);
+    "sendMapInChunks: original points=%zu, leaf_size=%.3f, drop_intensity=%s",
+    total_points_orig, leaf_size, drop_intensity ? "true" : "false");
+
+  // 1) Downsample with VoxelGrid
+  pcl::PointCloud<pcl::PointXYZI>::Ptr filtered(new pcl::PointCloud<pcl::PointXYZI>);
+  pcl::VoxelGrid<pcl::PointXYZI> voxel;
+  voxel.setInputCloud(map_cloud_ptr);
+  voxel.setLeafSize(leaf_size, leaf_size, leaf_size);
+  voxel.filter(*filtered);
+
+  RCLCPP_INFO(get_logger(), "After voxel grid filter: %zu points", filtered->size());
+
+  // 2) Optionally convert to PointXYZ (drop intensity) to reduce message size
+  //    If you don't need intensity for visualization / localization, this saves bytes.
+  pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_xyz;
+  pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_to_chunk;
+  if (drop_intensity) {
+    // keep intensity (no conversion)
+    cloud_to_chunk = filtered;
+  } else {
+    // convert to XYZ and later send as PointCloud2 built from XYZ (less bytes)
+    filtered_xyz.reset(new pcl::PointCloud<pcl::PointXYZ>);
+    filtered_xyz->reserve(filtered->size());
+    for (const auto &pt : filtered->points) {
+      pcl::PointXYZ q;
+      q.x = pt.x; q.y = pt.y; q.z = pt.z;
+      filtered_xyz->push_back(q);
+    }
+    // If you'd like to publish sensor_msgs::msg::PointCloud2 with XYZ only,
+    // we will convert from filtered_xyz in the chunk loop below.
+  }
+
+  // 3) Prepare chunking data source
+  std::size_t total_points = drop_intensity ? filtered->size() : filtered_xyz->size();
+  const std::size_t total_chunks = (total_points + points_per_chunk - 1) / points_per_chunk;
+
+  RCLCPP_INFO(
+    get_logger(),
+    "Chunking into %zu chunks (points_per_chunk=%zu, total_points_after_filter=%zu)",
+    total_chunks, points_per_chunk, total_points);
 
   for (std::size_t chunk_id = 0; chunk_id < total_chunks; ++chunk_id) {
     std::size_t start_idx = chunk_id * points_per_chunk;
     std::size_t end_idx = std::min(start_idx + points_per_chunk, total_points);
 
-    pcl::PointCloud<pcl::PointXYZI>::Ptr chunk_cloud(
-      new pcl::PointCloud<pcl::PointXYZI>);
-    chunk_cloud->reserve(end_idx - start_idx);
+    // build a chunk cloud
+    if (drop_intensity) {
+      pcl::PointCloud<pcl::PointXYZI>::Ptr chunk_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+      chunk_cloud->reserve(end_idx - start_idx);
+      for (std::size_t i = start_idx; i < end_idx; ++i) {
+        chunk_cloud->push_back((*filtered)[i]);
+      }
 
-    for (std::size_t i = start_idx; i < end_idx; ++i) {
-      chunk_cloud->push_back((*map_cloud_ptr)[i]);
+      sensor_msgs::msg::PointCloud2 cloud_msg;
+      pcl::toROSMsg(*chunk_cloud, cloud_msg);
+      cloud_msg.header.frame_id = global_frame_id_;
+      cloud_msg.header.stamp = now();
+
+      lidar_localization_ros2::msg::MapChunk chunk_msg;
+      chunk_msg.header = cloud_msg.header;
+      chunk_msg.map_id = map_id;
+      chunk_msg.chunk_id = static_cast<uint32_t>(chunk_id);
+      chunk_msg.total_chunks = static_cast<uint32_t>(total_chunks);
+      chunk_msg.cloud = cloud_msg;
+
+      chunk_pub_->publish(chunk_msg);
+      RCLCPP_INFO(
+        get_logger(),
+        "Published chunk %zu/%zu (points=%zu)",
+        chunk_id + 1, total_chunks, chunk_cloud->size());
+    } else {
+      // Using XYZ (no intensity)
+      pcl::PointCloud<pcl::PointXYZ>::Ptr chunk_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+      chunk_cloud->reserve(end_idx - start_idx);
+      for (std::size_t i = start_idx; i < end_idx; ++i) {
+        chunk_cloud->push_back((*filtered_xyz)[i]);
+      }
+
+      // convert to PointCloud2 (XYZ only)
+      sensor_msgs::msg::PointCloud2 cloud_msg;
+      pcl::toROSMsg(*chunk_cloud, cloud_msg);
+      cloud_msg.header.frame_id = global_frame_id_;
+      cloud_msg.header.stamp = now();
+
+      lidar_localization_ros2::msg::MapChunk chunk_msg;
+      chunk_msg.header = cloud_msg.header;
+      chunk_msg.map_id = map_id;
+      chunk_msg.chunk_id = static_cast<uint32_t>(chunk_id);
+      chunk_msg.total_chunks = static_cast<uint32_t>(total_chunks);
+      chunk_msg.cloud = cloud_msg;
+
+      chunk_pub_->publish(chunk_msg);
+      RCLCPP_INFO(
+        get_logger(),
+        "Published chunk %zu/%zu (points=%zu) [XYZ only]",
+        chunk_id + 1, total_chunks, chunk_cloud->size());
     }
-
-    sensor_msgs::msg::PointCloud2 cloud_msg;
-    pcl::toROSMsg(*chunk_cloud, cloud_msg);
-    cloud_msg.header.frame_id = global_frame_id_;
-    cloud_msg.header.stamp = now();
-
-    lidar_localization_ros2::msg::MapChunk chunk_msg;
-    chunk_msg.header = cloud_msg.header;
-    chunk_msg.map_id = map_id;
-    chunk_msg.chunk_id = static_cast<uint32_t>(chunk_id);
-    chunk_msg.total_chunks = static_cast<uint32_t>(total_chunks);
-    chunk_msg.cloud = cloud_msg;
-
-    chunk_pub_->publish(chunk_msg);
-
-    RCLCPP_INFO(
-      get_logger(),
-      "Published chunk %zu / %zu (%zu points)",
-      chunk_id + 1, total_chunks, chunk_cloud->size());
+    // optional small sleep to avoid saturating the network
+    // std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
 
   RCLCPP_INFO(get_logger(), "Finished sending chunks for map_id=%u", map_id);
 }
+
 
 CallbackReturn PCLLocalization::on_activate(const rclcpp_lifecycle::State &)
 {
@@ -241,6 +312,9 @@ CallbackReturn PCLLocalization::on_error(const rclcpp_lifecycle::State & state)
 void PCLLocalization::initializeParameters()
 {
   RCLCPP_INFO(get_logger(), "initializeParameters");
+  get_parameter("map_leaf_size", map_leaf_size_);
+  get_parameter("points_per_chunk", points_per_chunk_);
+  get_parameter("drop_intensity", drop_intensity_);
   get_parameter("global_frame_id", global_frame_id_);
   get_parameter("odom_frame_id", odom_frame_id_);
   get_parameter("base_frame_id", base_frame_id_);

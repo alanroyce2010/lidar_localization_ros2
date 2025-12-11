@@ -98,6 +98,9 @@ public:
   bool initialpose_recieved_{false};
 
   // parameters
+  double map_leaf_size_;
+  int points_per_chunk_;
+  bool drop_intensity_;
   std::string global_frame_id_;
   std::string odom_frame_id_;
   std::string base_frame_id_;
